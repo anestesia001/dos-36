@@ -1,0 +1,132 @@
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: always
+    - when: never
+
+stages:
+  - linting
+  - build
+  - scan
+  - test
+  - deploy
+  - check
+
+variables:
+  REGISTRY_USER: anestesia01
+  IMAGE: ${REGISTRY_USER}/dos36:${CI_COMMIT_SHORT_SHA}
+  IMAGE_KANIKO: ${REGISTRY_USER}/dos36:kaniko-${CI_COMMIT_SHORT_SHA}
+  DEPLOY_USER: gitlab-runner
+  HOST: 158.160.2.32
+  PRJ_DIR: /home/gitlab-runner/notes
+  REGISTRY: https://index.docker.io/v1/
+
+code_lint:
+  stage: linting
+  image: golangci/golangci-lint
+  script:
+    - golangci-lint run -v
+  tags:
+    - dos-36
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+docker_lint:
+  stage: linting
+  image: hadolint/hadolint:latest-debian
+  script:
+    - hadolint backend/Dockerfile
+  tags:
+    - dos-36
+  allow_failure: true
+
+build_image:
+  stage: build
+  image: docker:29.8.1
+  services:
+    - name: docker:dind
+      alias: docker
+  before_script:
+    - docker login -u ${REGISTRY_USER} -p ${REGISTRY_TOKEN}
+  script:
+    - docker build -t ${IMAGE} backend/
+    - docker push ${IMAGE}
+  tags:
+    - dos-36
+
+build_image_kaniko:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$REGISTRY\":{\"username\":\"$REGISTRY_USER\",\"password\":\"$REGISTRY_TOKEN\"}}}" > /kaniko/.docker/config.json
+    - /kaniko/executor
+        --context ./backend
+        --dockerfile ./backend/Dockerfile
+        --destination $IMAGE_KANIKO
+  tags:
+    - dos-36
+  when: manual
+
+scan_image:
+  stage: scan
+  image:
+    name: docker.io/aquasec/trivy:latest
+    entrypoint: [""]
+  variables:
+    GIT_STRATEGY: none
+    TRIVY_USERNAME: "$REGISTRY_USER"
+    TRIVY_PASSWORD: "$REGISTRY_TOKEN"
+    TRIVY_AUTH_URL: "${REGISTRY_USER}/dos36"
+    TRIVY_NO_PROGRESS: "true"
+    TRIVY_CACHE_DIR: ".trivycache/"
+    FULL_IMAGE_NAME: $IMAGE
+  script:
+    - trivy --version
+    - time trivy image --download-db-only
+    - time trivy image --exit-code 0 --format template --template "@/contrib/gitlab.tpl"
+        --output "$CI_PROJECT_DIR/gl-container-scanning-report.json" "$FULL_IMAGE_NAME"
+    - time trivy image --exit-code 0 "$FULL_IMAGE_NAME"
+    - time trivy image --exit-code 1 --severity CRITICAL "$FULL_IMAGE_NAME"
+  cache:
+    paths:
+      - .trivycache/
+  artifacts:
+    when: always
+    reports:
+      container_scanning: gl-container-scanning-report.json
+  tags:
+    - dos-36
+
+deploy_app:
+  stage: deploy
+  needs:
+    - build_image
+  before_script:
+    - apk add --no-cache openssh rsync
+    - mkdir -p ~/.ssh
+    - cat $SSH_KEY > ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - ssh-keyscan $HOST >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ${DEPLOY_USER}@${HOST} "
+        docker pull $IMAGE ;
+        cd $PRJ_DIR ;
+        python3 set_env.py $IMAGE ;
+        docker compose up -d
+      "
+  tags:
+    - dos-36
+
+check_app:
+  stage: check
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - curl ${HOST}:8081/api/notes
+  tags:
+    - dos-36
